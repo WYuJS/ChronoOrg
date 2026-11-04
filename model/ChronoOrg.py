@@ -3,14 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# =========================================================
-# RevIN
-# =========================================================
 class RevIN(nn.Module):
-    """
-    Reversible Instance Normalization
-    x: [B, L, C]
-    """
+    """Reversible instance normalization for tensors of shape [B, L, C]."""
+
     def __init__(self, num_features, eps=1e-5, affine=True, subtract_last=False):
         super().__init__()
         self.num_features = num_features
@@ -73,10 +68,9 @@ class RevIN(nn.Module):
         return x
 
 
-# =========================================================
-# DropPath
-# =========================================================
 class DropPath(nn.Module):
+    """Stochastic depth applied independently to each sample."""
+
     def __init__(self, drop_prob=0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -91,12 +85,9 @@ class DropPath(nn.Module):
         return x.div(keep_prob) * random_tensor
 
 
-# =========================================================
-# Temporal Tokenizer
-# Input : [B*C, L]
-# Output: [B*C, N, d_model]
-# =========================================================
 class TemporalTokenizer(nn.Module):
+    """Temporal Tokenizer: map [B*C, L] to patch tokens [B*C, N, D]."""
+
     def __init__(self, patch_len, stride, d_model, bias=True):
         super().__init__()
         self.patch_len = patch_len
@@ -113,17 +104,15 @@ class TemporalTokenizer(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B*C, L]
-        x = x.unsqueeze(1)          # [B*C, 1, L]
-        x = self.proj(x)            # [B*C, D, N]
-        x = x.transpose(1, 2)       # [B*C, N, D]
+        x = x.unsqueeze(1)
+        x = self.proj(x)
+        x = x.transpose(1, 2)
         return x
 
 
-# =========================================================
-# Feed Forward
-# =========================================================
 class TemporalFeedForward(nn.Module):
+    """Temporal Feed-Forward Network applied to each token."""
+
     def __init__(self, dim, hidden_dim, out_dim, dropout=0.0):
         super().__init__()
         self.dim = dim
@@ -147,13 +136,9 @@ class TemporalFeedForward(nn.Module):
         return x
 
 
-# =========================================================
-# Temporal Injector
-# =========================================================
-class TemporalInjector(nn.Module):
-    """
-    x: [B_, W, C]
-    """
+class OffsetAwareTemporalInjection(nn.Module):
+    """Offset-Aware Temporal Injection (TI) over raw-time patch positions."""
+
     def __init__(self, dim, period=24, patch_len=16, stride=8):
         super().__init__()
         self.dim = dim
@@ -163,7 +148,6 @@ class TemporalInjector(nn.Module):
 
         self.temporalQuery = nn.Parameter(torch.zeros(period, dim))
 
-        # learnable relative-position pooling over patch_len
         self.patch_pos_weight = nn.Parameter(torch.zeros(patch_len))
 
         self.register_buffer("_window_offset", None, persistent=False)
@@ -178,42 +162,39 @@ class TemporalInjector(nn.Module):
         B_, N, C = x.shape
 
         if self._window_offset is None:
-            raise RuntimeError("TemporalInjector requires set_window_offset(offset) before forward.")
+            raise RuntimeError("OffsetAwareTemporalInjection requires set_window_offset(offset) before forward.")
 
         offset = self._window_offset.view(-1)
         if offset.numel() != B_:
             raise RuntimeError(
-                f"TemporalInjector offset mismatch: got {offset.numel()}, expected {B_}."
+                f"OffsetAwareTemporalInjection offset mismatch: got {offset.numel()}, expected {B_}."
             )
 
+        # Windows at the same offset share the same temporal encoding.
         unique_offset, inverse = torch.unique(offset, sorted=True, return_inverse=True)
 
         t_local = torch.arange(N, device=x.device).long()
-        t_global = unique_offset[:, None] + t_local[None, :]           # [U, N]
+        t_global = unique_offset[:, None] + t_local[None, :]
 
         patch_inner = torch.arange(self.patch_len, device=x.device).long()
 
+        # Map stage-token offsets and patch-inner positions to raw-time phases.
         gather_index = (
             t_global[:, :, None] * self.stride
             + patch_inner.view(1, 1, -1)
-        ) % self.period                                                # [U, N, patch_len]
+        ) % self.period
 
-        temporal_query = self.temporalQuery[gather_index.long()]       # [U, N, patch_len, C]
+        temporal_query = self.temporalQuery[gather_index.long()]
 
-        # [patch_len]
         weight = torch.softmax(self.patch_pos_weight, dim=0)
 
-        # weighted sum over patch_len
         t_embed_unique = (temporal_query * weight.view(1, 1, self.patch_len, 1)).sum(dim=2)
-        # [U, N, C]
 
-        t_embed = t_embed_unique[inverse]                              # [B_, N, C]
+        t_embed = t_embed_unique[inverse]
 
         return x + t_embed
 
-# =========================================================
-# Window utils
-# =========================================================
+
 def temporal_window_partition(x, window_size):
     """
     x: [B, N, C]
@@ -250,142 +231,9 @@ def build_window_offsets(B, num_windows, window_size, device):
     return offset
 
 
-# =========================================================
-# Global Context Encoder
-# =========================================================
-# class GlobalContextEncoder(nn.Module):
-#     def __init__(self, dim, target_tokens):
-#         super().__init__()
-#         self.dim = dim
-#         self.target_tokens = target_tokens
-#         self.norm = nn.LayerNorm(dim)
+class SequenceContextEncoder(nn.Module):
+    """Sequence Context Encoder (SCE) producing fixed-length context tokens."""
 
-#     def forward(self, x):
-#         # x: [B, N, D]
-#         B, N, D = x.shape
-
-#         if self.target_tokens >= N:
-#             out = x
-#         else:
-#             boundaries = torch.linspace(
-#                 0, N, steps=self.target_tokens + 1, device=x.device
-#             ).long()
-#             idx = []
-#             for i in range(self.target_tokens):
-#                 s = boundaries[i].item()
-#                 e = boundaries[i + 1].item()
-#                 e = max(e, s + 1)
-#                 idx.append(e - 1)
-#             idx = torch.tensor(idx, device=x.device, dtype=torch.long)
-#             out = x[:, idx, :]   # [B, T, D]
-
-#         out = self.norm(out)
-#         return out
-############################################################效果还行
-class MixerMLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.act = nn.SiLU()
-        self.drop1 = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dim, dim)
-        self.drop2 = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop1(x)
-        x = self.fc2(x)
-        x = self.drop2(x)
-        return x
-
-
-# class GlobalContextEncoder(nn.Module):
-#     """
-#     Input : [B, N, D]
-#     Output: [B, target_tokens, D]
-
-#     做法：
-#     1) 先把任意长度 N 对齐到固定 mixer_tokens
-#     2) 做 token mixing
-#     3) 做 channel mixing
-#     4) 再压到 target_tokens
-#     """
-#     def __init__(
-#         self,
-#         dim,
-#         target_tokens,
-#         mixer_tokens=None,
-#         token_mlp_ratio=0.5,
-#         channel_mlp_ratio=2.0,
-#         dropout=0.0,
-#     ):
-#         super().__init__()
-#         self.dim = dim
-#         self.target_tokens = target_tokens
-#         self.mixer_tokens = mixer_tokens if mixer_tokens is not None else target_tokens * 2
-
-#         token_hidden_dim = max(1, int(self.mixer_tokens * token_mlp_ratio))
-#         channel_hidden_dim = max(1, int(dim * channel_mlp_ratio))
-
-#         # token mixing over fixed mixer_tokens
-#         self.norm1 = nn.LayerNorm(dim)
-#         self.token_mlp = MixerMLP(
-#             dim=self.mixer_tokens,
-#             hidden_dim=token_hidden_dim,
-#             dropout=dropout,
-#         )
-
-#         # channel mixing
-#         self.norm2 = nn.LayerNorm(dim)
-#         self.channel_mlp = MixerMLP(
-#             dim=dim,
-#             hidden_dim=channel_hidden_dim,
-#             dropout=dropout,
-#         )
-
-#         # fixed-length compression: mixer_tokens -> target_tokens
-#         self.token_down = nn.Linear(self.mixer_tokens, target_tokens, bias=False)
-
-#         self.out_norm = nn.LayerNorm(dim)
-
-#     def forward(self, x):
-#         # x: [B, N, D]
-#         B, N, D = x.shape
-
-#         # 先把任意 N 对齐到固定 mixer_tokens
-#         if N != self.mixer_tokens:
-#             x = x.transpose(1, 2)  # [B, D, N]
-#             x = F.interpolate(
-#                 x,
-#                 size=self.mixer_tokens,
-#                 mode="linear",
-#                 align_corners=False,
-#             )
-#             x = x.transpose(1, 2)  # [B, mixer_tokens, D]
-
-#         # 1) token mixing
-#         y = self.norm1(x)          # [B, Tm, D]
-#         y = y.transpose(1, 2)      # [B, D, Tm]
-#         y = self.token_mlp(y)      # [B, D, Tm]
-#         y = y.transpose(1, 2)      # [B, Tm, D]
-#         x = x + y
-
-#         # 2) channel mixing
-#         y = self.norm2(x)          # [B, Tm, D]
-#         y = self.channel_mlp(y)    # [B, Tm, D]
-#         x = x + y
-
-#         # 3) token compression: mixer_tokens -> target_tokens
-#         x = x.transpose(1, 2)      # [B, D, Tm]
-#         x = self.token_down(x)     # [B, D, target_tokens]
-#         x = x.transpose(1, 2)      # [B, target_tokens, D]
-
-#         x = self.out_norm(x)
-#         return x
-
-
-class GlobalContextEncoder(nn.Module):
     def __init__(self, dim, target_tokens):
         super().__init__()
         self.dim = dim
@@ -402,7 +250,6 @@ class GlobalContextEncoder(nn.Module):
         self.max_pool = nn.AdaptiveMaxPool1d(target_tokens)
 
     def forward(self, x):
-        # x: [B, N, D]
         x = x.transpose(1, 2)
         x = self.conv(x)
 
@@ -414,18 +261,9 @@ class GlobalContextEncoder(nn.Module):
         return x
 
 
+class BoundedTemporalInteraction(nn.Module):
+    """Bounded Temporal Interaction (BTI) within each temporal window."""
 
-
-
-
-
-
-
-# =========================================================
-# Locality-bounded Temporal Interaction
-# interaction constrained by a stage-specific temporal bound
-# =========================================================
-class LoTemporalInteraction(nn.Module):
     def __init__(self, dim, num_heads, window_size, qkv_bias=True, dropout=0.0, period=24, patch_len=16, stride=8):
         super().__init__()
         assert dim % num_heads == 0, f"dim={dim} must be divisible by num_heads={num_heads}"
@@ -442,7 +280,7 @@ class LoTemporalInteraction(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.temporal_injector = TemporalInjector(
+        self.temporal_injector = OffsetAwareTemporalInjection(
             dim=dim,
             period=period,
             patch_len=patch_len,
@@ -478,13 +316,9 @@ class LoTemporalInteraction(nn.Module):
         return out
 
 
-# =========================================================
-# Global Temporal Attention
-# =========================================================
-# =========================================================
-# Global Temporal Attention
-# =========================================================
-class GlobalTemporalAttention(nn.Module):
+class ContextConditionedTemporalAttention(nn.Module):
+    """Context-Conditioned Temporal Attention (CCTA) with window-local values."""
+
     def __init__(self, dim, num_heads, window_size, qkv_bias=True, dropout=0.0, period=24, patch_len=16, stride=8):
         super().__init__()
         assert dim % num_heads == 0, f"dim={dim} must be divisible by num_heads={num_heads}"
@@ -501,28 +335,11 @@ class GlobalTemporalAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        # global q content branch
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
 
-        # local kv branch
         self.kv_proj = nn.Linear(dim, dim * 2, bias=qkv_bias)
 
-        # -------------------------------------------------
-        # temporal query code for global q
-        # old version: manually build temporal query
-        # -------------------------------------------------
-        # self.temporalQuery = nn.Parameter(torch.zeros(period, dim))
-        #
-        # # learnable relative-position pooling over patch_len
-        # self.patch_pos_weight = nn.Parameter(torch.zeros(patch_len))
-        #
-        # self.register_buffer("_window_offset", None, persistent=False)
-
-        # -------------------------------------------------
-        # new version: directly reuse TemporalInjector
-        # q = q_content + temporal embedding
-        # -------------------------------------------------
-        self.temporal_injector = TemporalInjector(
+        self.temporal_injector = OffsetAwareTemporalInjection(
             dim=dim,
             period=period,
             patch_len=patch_len,
@@ -534,17 +351,9 @@ class GlobalTemporalAttention(nn.Module):
         self.proj_drop = nn.Dropout(dropout)
 
     def set_window_offset(self, offset):
-        # old version:
-        # self._window_offset = None if offset is None else offset.long()
-
-        # new version:
         self.temporal_injector.set_window_offset(offset)
 
     def clear_window_offset(self):
-        # old version:
-        # self._window_offset = None
-
-        # new version:
         self.temporal_injector.clear_window_offset()
 
     def forward(self, x, global_context):
@@ -557,71 +366,20 @@ class GlobalTemporalAttention(nn.Module):
         if global_context is None:
             global_context = x
 
-        # align global context length to current window length
         if global_context.shape[1] != N:
             global_context = F.interpolate(
                 global_context.transpose(1, 2),
                 size=N,
                 mode="linear",
                 align_corners=False,
-            ).transpose(1, 2)   # [B_, N, C]
+            ).transpose(1, 2)
 
-        # -------------------------------------------------
-        # 1) content query from global context
-        # -------------------------------------------------
-        q_content = self.q_proj(global_context)   # [B_, N, C]
+        q_content = self.q_proj(global_context)
 
-        # -------------------------------------------------
-        # 2) temporal query with periodic indexing
-        #    old version: manually build q_time
-        # -------------------------------------------------
-        # if self._window_offset is None:
-        #     raise RuntimeError(
-        #         "GlobalTemporalAttention requires set_window_offset(offset) before forward."
-        #     )
-        #
-        # offset = self._window_offset.view(-1)
-        # if offset.numel() != B_:
-        #     raise RuntimeError(
-        #         f"GlobalTemporalAttention offset mismatch: got {offset.numel()}, expected {B_}."
-        #     )
-        #
-        # unique_offset, inverse = torch.unique(offset, sorted=True, return_inverse=True)
-        #
-        # t_local = torch.arange(N, device=x.device).long()              # [N]
-        # t_global = unique_offset[:, None] + t_local[None, :]           # [U, N]
-        #
-        # patch_inner = torch.arange(self.patch_len, device=x.device).long()
-        # gather_index = (
-        #     t_global[:, :, None] * self.stride
-        #     + patch_inner.view(1, 1, -1)
-        # ) % self.period                                                # [U, N, patch_len]
-        #
-        # temporal_query = self.temporalQuery[gather_index.long()]       # [U, N, patch_len, C]
-        #
-        # # [patch_len]
-        # weight = torch.softmax(self.patch_pos_weight, dim=0)
-        #
-        # # weighted sum over patch_len
-        # q_time_unique = (
-        #     temporal_query * weight.view(1, 1, self.patch_len, 1)
-        # ).sum(dim=2)                                                   # [U, N, C]
-        #
-        # q_time = q_time_unique[inverse]                                # [B_, N, C]
-        #
-        # # final query
-        # q = q_content + q_time                                         # [B_, N, C]
-
-        # -------------------------------------------------
-        # new version: directly inject temporal code into q_content
-        # TemporalInjector forward already returns:
-        # q_content + temporal embedding
-        # -------------------------------------------------
-        q = self.temporal_injector(q_content)                           # [B_, N, C]
+        q = self.temporal_injector(q_content)
 
         q = q.reshape(B_, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # key/value from local window tokens
         kv = self.kv_proj(x).reshape(B_, N, 2, self.num_heads, self.head_dim)
         k, v = kv.permute(2, 0, 3, 1, 4)
 
@@ -635,10 +393,10 @@ class GlobalTemporalAttention(nn.Module):
         out = self.proj_drop(out)
         return out
 
-# =========================================================
-# ChronoOrg Block
-# =========================================================
+
 class ChronoOrgBlock(nn.Module):
+    """A BTI or CCTA block with its own normalization, residuals, and FFN."""
+
     def __init__(
         self,
         dim,
@@ -671,7 +429,7 @@ class ChronoOrgBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
 
         if self.use_global:
-            self.attn = GlobalTemporalAttention(
+            self.attn = ContextConditionedTemporalAttention(
                 dim=dim,
                 num_heads=num_heads,
                 window_size=window_size,
@@ -682,7 +440,7 @@ class ChronoOrgBlock(nn.Module):
                 stride=stride,
             )
         else:
-            self.attn = LoTemporalInteraction(
+            self.attn = BoundedTemporalInteraction(
                 dim=dim,
                 num_heads=num_heads,
                 window_size=window_size,
@@ -745,10 +503,9 @@ class ChronoOrgBlock(nn.Module):
         return x
 
 
-# =========================================================
-# Temporal Merger
-# =========================================================
-class TemporalMerger(nn.Module):
+class TemporalMerge(nn.Module):
+    """Temporal Merge: compose adjacent tokens into a coarser representation."""
+
     def __init__(self, dim, out_dim):
         super().__init__()
         self.dim = dim
@@ -777,10 +534,9 @@ class TemporalMerger(nn.Module):
         return x
 
 
-# =========================================================
-# ChronoOrg Stage
-# =========================================================
 class ChronoOrgStage(nn.Module):
+    """ChronoOrg Stage with shared sequence context and optional Temporal Merge."""
+
     def __init__(
         self,
         dim,
@@ -822,7 +578,7 @@ class ChronoOrgStage(nn.Module):
         self.patch_len = patch_len
         self.stride = stride
 
-        self.global_encoder = GlobalContextEncoder(
+        self.global_encoder = SequenceContextEncoder(
             dim=dim,
             target_tokens=global_tokens,
         )
@@ -845,9 +601,10 @@ class ChronoOrgStage(nn.Module):
             for i in range(depth)
         ])
 
-        self.downsample = TemporalMerger(dim=dim, out_dim=out_dim) if downsample else None
+        self.downsample = TemporalMerge(dim=dim, out_dim=out_dim) if downsample else None
 
     def forward(self, x):
+        # Reuse the stage-input context in every CCTA block.
         global_context = self.global_encoder(x)
 
         for blk in self.blocks:
@@ -859,10 +616,9 @@ class ChronoOrgStage(nn.Module):
         return x
 
 
-# =========================================================
-# Temporal Head
-# =========================================================
 class TemporalHead(nn.Module):
+    """Pool normalized tokens and project them to the forecast horizon."""
+
     def __init__(self, d_model, out_len, pooling="mean", dropout=0.0):
         super().__init__()
         assert pooling in ["mean", "last"], f"Unsupported pooling: {pooling}"
@@ -886,61 +642,43 @@ class TemporalHead(nn.Module):
         return x
 
 
-# =========================================================
-# ChronoOrg
-# 所有核心子模块参数集中在这里
-# =========================================================
 class ChronoOrg(nn.Module):
-    """
-    Input : [B, seq_len, enc_in]
-    Output: [B, pred_len, enc_in]
-    """
+    """ChronoOrg: forecast [B, pred_len, enc_in] from [B, seq_len, enc_in]."""
+
     def __init__(
         self,
-        # task
         enc_in,
         seq_len,
         pred_len,
 
-        # tokenizer
         patch_len=16,
         stride=8,
         tokenizer_bias=True,
 
-        # stage dims / topology
         dim=64,
         stage_dims=None,
         depths=(2, 2, 4),
         num_heads=(2, 4, 8),
         window_size=(8, 8, 4),
 
-        # FFN
         ffn_hidden_dim=None,
         mlp_ratio=4.0,
 
-        # global context
         global_tokens=None,
 
-        # local-global routing
         stage_use_global=None,
 
-        # regularization
         dropout=0.1,
 
-        # attention
         qkv_bias=True,
 
-        # residual / stage
         layer_scale=None,
         downsample=True,
 
-        # temporal prior
         period=24,
 
-        # head
         pooling="mean",
 
-        # RevIN
         revin=True,
         revin_eps=1e-5,
         affine=True,
@@ -1102,28 +840,23 @@ class ChronoOrg(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B, L, C]
         B, L, C = x.shape
         assert C == self.enc_in, f"Expected enc_in={self.enc_in}, got C={C}"
 
         if self.use_revin:
             x = self.revin(x, "norm")
 
-        # channel-independent modeling
-        x = x.permute(0, 2, 1).contiguous().reshape(B * C, L)  # [B*C, L]
+        # Apply the shared backbone independently to each variable.
+        x = x.permute(0, 2, 1).contiguous().reshape(B * C, L)
 
-        # tokenizer
-        x = self.tokenizer(x)                                  # [B*C, N, D0]
+        x = self.tokenizer(x)
 
-        # hierarchical stages
         for stage in self.stages:
             x = stage(x)
 
-        # head
         x = self.norm(x)
-        out = self.head(x)                                     # [B*C, pred_len]
+        out = self.head(x)
 
-        # reshape back
         out = out.view(B, C, self.pred_len).permute(0, 2, 1).contiguous()
 
         if self.use_revin:
