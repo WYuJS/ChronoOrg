@@ -1,0 +1,20 @@
+# Local backups and Python caches
+.codex-backups/
+__pycache__/
+*.py[cod]
+
+# Local environments and credentials
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Datasets and generated experiment artifacts
+/data/
+/result_forecast/
+/experiments/logs/
+/experiments/TXT/
+*.pth
+*.pt
+*.ckpt
